@@ -1,0 +1,4 @@
+.gcloudignore
+*.png
+.env
+.DS_Store
