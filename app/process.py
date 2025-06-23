@@ -146,15 +146,15 @@ def can_break_before(word):
     return True
 
 def create_furigana_image(text, width=1264, height=1680, main_size=32, furigana_size=16):
-    """Create an image with Japanese text and furigana"""
+    """Create an 8-bit grayscale image with Japanese text and furigana"""
     
     # Load fonts
     font_path = get_font_path()
     main_font = ImageFont.truetype(font_path, main_size)
     furigana_font = ImageFont.truetype(font_path, furigana_size)
     
-    # Create image
-    img = Image.new('RGB', (width, height), 'white')
+    # Create grayscale image (mode 'L' for 8-bit grayscale)
+    img = Image.new('L', (width, height), 255)  # 255 = white in grayscale
     draw = ImageDraw.Draw(img)
     
     # Parse the text and break into words
@@ -241,7 +241,8 @@ def draw_line(draw, line_words, start_x, y, main_font, furigana_font, furigana_s
     
     for word in line_words:
         if word['type'] == 'text':
-            draw.text((x, y), word['content'], font=main_font, fill='black')
+            # Use 0 for black text in grayscale (0=black, 255=white)
+            draw.text((x, y), word['content'], font=main_font, fill=0)
             bbox = draw.textbbox((0, 0), word['content'], font=main_font)
             x += bbox[2] - bbox[0]
         elif word['type'] == 'furigana':  # furigana type
@@ -255,12 +256,12 @@ def draw_line(draw, line_words, start_x, y, main_font, furigana_font, furigana_s
             kanji_x = x
             furigana_x = x + (kanji_width - furigana_width) / 2
             
-            # Draw furigana above
+            # Draw furigana above (black text)
             draw.text((furigana_x, y - furigana_size + 2.5), word['reading'], 
-                     font=furigana_font, fill='black')
+                     font=furigana_font, fill=0)
             
-            # Draw kanji
-            draw.text((kanji_x, y), word['kanji'], font=main_font, fill='black')
+            # Draw kanji (black text)
+            draw.text((kanji_x, y), word['kanji'], font=main_font, fill=0)
             
             x += max(kanji_width, furigana_width)
         
@@ -325,9 +326,9 @@ if __name__ == "__main__":
         # Create the image
         img = create_furigana_image(japanese_text)
         
-        # Save the image
-        img.save('result.png')
-        print("Image saved as 'result.png'")
+        # Save as 8-bit grayscale PNG
+        img.save('result.png', 'PNG', optimize=True)
+        print("8-bit grayscale image saved as 'result.png'")
         
         # Optionally display the image (if running in an environment that supports it)
         # img.show()

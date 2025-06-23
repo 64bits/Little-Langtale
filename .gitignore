@@ -2,3 +2,4 @@
 *.png
 .env
 .DS_Store
+**/*.pyc
