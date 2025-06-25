@@ -79,6 +79,7 @@ EOF
 # return number of minutes until next update
 get_time_to_next_update () {
 	CURRENTMINUTE=$(( 60*`date +%-H` + `date +%-M` ))
+	NEXTUPDATE=-1  # Initialize to invalid value
 
 	for schedule in $SCHEDULE; do
 		read STARTHOUR STARTMINUTE ENDHOUR ENDMINUTE INTERVAL << EOF
@@ -93,42 +94,75 @@ EOF
 
 		# if this schedule entry covers the current time, use it
 		elif [ $CURRENTMINUTE -ge $START ] && [ $CURRENTMINUTE -lt $END ]; then
-			logger "Schedule $schedule used, next update in $INTERVAL minutes"
-			NEXTUPDATE=$(( $CURRENTMINUTE + $INTERVAL))
+			logger "Schedule $schedule active, interval is $INTERVAL minutes"
+			CANDIDATE_UPDATE=$(( $CURRENTMINUTE + $INTERVAL))
+			if [ $NEXTUPDATE -eq -1 ] || [ $CANDIDATE_UPDATE -lt $NEXTUPDATE ]; then
+				NEXTUPDATE=$CANDIDATE_UPDATE
+			fi
 
-		# if the next update falls into (or overlaps) a following schedule
-		# entry, apply this schedule entry instead if it would trigger earlier
-		elif [ $(( $START + $INTERVAL )) -lt $NEXTUPDATE ]; then
+		# if the next update would fall into a following schedule entry
+		elif [ $NEXTUPDATE -ne -1 ] && [ $(( $START + $INTERVAL )) -lt $NEXTUPDATE ]; then
 			logger "Selected timeout will overlap $schedule, applying it instead"
 			NEXTUPDATE=$(( $START + $INTERVAL ))
 		fi
 	done
 
-	logger "Next update in $(( $NEXTUPDATE - $CURRENTMINUTE )) minutes"
-	echo $(( $NEXTUPDATE - $CURRENTMINUTE ))
+	if [ $NEXTUPDATE -eq -1 ]; then
+		# No valid schedule found, use default interval
+		NEXTUPDATE=$(( $CURRENTMINUTE + ${INTERVAL:-240} ))
+		logger "No active schedule, using default interval"
+	fi
+
+	MINUTES_TO_WAIT=$(( $NEXTUPDATE - $CURRENTMINUTE ))
+	
+	# If we're already past the update time, schedule for next interval
+	if [ $MINUTES_TO_WAIT -le 0 ]; then
+		logger "Past scheduled time, triggering update now"
+		echo 0
+	else
+		logger "Next update in $MINUTES_TO_WAIT minutes"
+		echo $MINUTES_TO_WAIT
+	fi
 }
 
 ##############################################################################
 
-# perform update and handle power management efficiently
+# perform update with timeout protection (Kindle-compatible)
 do_update_cycle () {
 	logger "Starting update cycle"
 	
-	# Run the update
-	sh ./update.sh
+	# Run the update in background
+	sh ./update.sh &
+	UPDATE_PID=$!
 	
-	# Get time until next update
-	WAIT_MINUTES=$(get_time_to_next_update)
-	WAIT_SECONDS=$(( $WAIT_MINUTES * 60 ))
+	# Wait for update to complete with timeout
+	TIMEOUT=300  # 5 minutes
+	ELAPSED=0
 	
-	logger "Next update in $WAIT_MINUTES minutes ($WAIT_SECONDS seconds)"
+	while [ $ELAPSED -lt $TIMEOUT ]; do
+		if ! kill -0 $UPDATE_PID 2>/dev/null; then
+			# Process has finished
+			wait $UPDATE_PID
+			UPDATE_RESULT=$?
+			if [ $UPDATE_RESULT -eq 0 ]; then
+				logger "Update completed successfully in $ELAPSED seconds"
+			else
+				logger "Update failed with exit code $UPDATE_RESULT after $ELAPSED seconds"
+			fi
+			return
+		fi
+		
+		sleep 5
+		ELAPSED=$(( $ELAPSED + 5 ))
+	done
 	
-	# Set RTC wakeup for next update
-	set_rtc_wakeup_absolute $WAIT_SECONDS
-	
-	# Allow device to suspend after a brief delay
+	# Timeout reached - kill the update process
+	logger "Update timed out after $TIMEOUT seconds, killing process $UPDATE_PID"
+	kill $UPDATE_PID 2>/dev/null
 	sleep 2
-	logger "Update cycle complete, allowing device to suspend"
+	kill -9 $UPDATE_PID 2>/dev/null  # Force kill if still running
+	
+	logger "Update cycle finished (timed out)"
 }
 
 ##############################################################################
@@ -136,29 +170,50 @@ do_update_cycle () {
 # use a 48 hour schedule
 extend_schedule
 
-# Main execution loop - much simpler and battery efficient
+# Main execution loop with error recovery
 while true; do
 	DEVICE_STATUS=$(lipc-get-prop com.lab126.powerd status)
 	logger "Device status: $DEVICE_STATUS"
 	
 	case "$DEVICE_STATUS" in
 		*"Screen Saver"*)
-			logger "Device in screensaver mode - performing update"
+			logger "Device in screensaver mode - performing scheduled update"
+			
+			# Record start time for timeout detection
+			UPDATE_START_TIME=$(currentTime)
 			do_update_cycle
+			UPDATE_END_TIME=$(currentTime)
+			UPDATE_DURATION=$(( $UPDATE_END_TIME - $UPDATE_START_TIME ))
+			
+			logger "Update took $UPDATE_DURATION seconds"
+			
+			# Wait for next scheduled update
+			WAIT_MINUTES=$(get_time_to_next_update)
+			logger "Next update in $WAIT_MINUTES minutes, sleeping until then"
+			wait_for_suspend $(( $WAIT_MINUTES * 60 ))
 			;;
 		*"Ready"*)
-			logger "Device ready - performing update"
+			logger "Device ready - performing scheduled update"
+			
+			# Record start time for timeout detection
+			UPDATE_START_TIME=$(currentTime)
 			do_update_cycle
-			;;
-		*"Charging: Yes"*)
-			logger "Device charging - performing update"
-			do_update_cycle
+			UPDATE_END_TIME=$(currentTime)
+			UPDATE_DURATION=$(( $UPDATE_END_TIME - $UPDATE_START_TIME ))
+			
+			logger "Update took $UPDATE_DURATION seconds"
+			
+			# Wait for next scheduled update  
+			WAIT_MINUTES=$(get_time_to_next_update)
+			logger "Next update in $WAIT_MINUTES minutes, sleeping until then"
+			wait_for_suspend $(( $WAIT_MINUTES * 60 ))
 			;;
 		*)
-			logger "Device in other state, waiting 30 seconds before recheck"
-			# Use RTC wakeup even for short waits to save power
-			set_rtc_wakeup_absolute 30
-			sleep 30
+			logger "Device in other state, waiting 60 seconds before recheck"
+			wait_for_suspend 60
 			;;
 	esac
+	
+	# Safety check - if we somehow get here without sleeping, add a small delay
+	sleep 1
 done

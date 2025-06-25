@@ -57,7 +57,7 @@ DISABLE_WIFI=0
 
 # Domain to ping to test network connectivity. Default should work, but in
 # case some firewall blocks access, try a popular local website.
-TEST_DOMAIN="www.google.com"
+TEST_DOMAIN="8.8.8.8"
 
 # How long (in seconds) to wait for an internet connection to be established
 # (if you experience frequent timeouts when waking up from sleep, try to
