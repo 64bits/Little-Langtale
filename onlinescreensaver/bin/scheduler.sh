@@ -2,13 +2,13 @@
 #
 ##############################################################################
 #
-# Fetch weather screensaver from a configurable URL at configurable intervals.
+# Battery-efficient weather screensaver scheduler for Kindle
 #
 # Features:
-#   - updates even when device is suspended
-#   - refreshes screensaver image if active
-#   - turns WiFi on and back off if necessary
-#   - tries to use as little CPU as possible
+#   - updates on schedule while allowing device suspension
+#   - uses RTC wakeup to minimize battery drain
+#   - only stays awake during actual updates
+#   - handles screensaver and ready states efficiently
 #
 ##############################################################################
 
@@ -29,9 +29,8 @@ if [ -e "utils.sh" ]; then
 	source ./utils.sh
 else
 	echo "Could not find utils.sh in `pwd`"
-	exit
+	exit 1
 fi
-
 
 ###############################################################################
 
@@ -75,7 +74,6 @@ EOF
 	logger "Full two day schedule: $SCHEDULE"
 }
 
-
 ##############################################################################
 
 # return number of minutes until next update
@@ -110,62 +108,57 @@ EOF
 	echo $(( $NEXTUPDATE - $CURRENTMINUTE ))
 }
 
+##############################################################################
+
+# perform update and handle power management efficiently
+do_update_cycle () {
+	logger "Starting update cycle"
+	
+	# Run the update
+	sh ./update.sh
+	
+	# Get time until next update
+	WAIT_MINUTES=$(get_time_to_next_update)
+	WAIT_SECONDS=$(( $WAIT_MINUTES * 60 ))
+	
+	logger "Next update in $WAIT_MINUTES minutes ($WAIT_SECONDS seconds)"
+	
+	# Set RTC wakeup for next update
+	set_rtc_wakeup_absolute $WAIT_SECONDS
+	
+	# Allow device to suspend after a brief delay
+	sleep 2
+	logger "Update cycle complete, allowing device to suspend"
+}
+
+##############################################################################
+
 # use a 48 hour schedule
 extend_schedule
 
-while [ 1 -eq 1 ]
-do
-	logger "loooop"
-	exitloop=0
-
-	if [ `lipc-get-prop com.lab126.powerd status | grep "Screen Saver" | wc -l` -gt 0 ]
-	then
-		logger "Running update on Screen Saver status"
-
-		sh ./update.sh
-
-		while [ $exitloop -eq 0 ]
-		do
-			if [ `lipc-get-prop com.lab126.powerd status | grep "Ready" | wc -l` -gt 0 ]
-			then
-				lipc-set-prop com.lab126.powerd deferSuspend 3000000
-				exitloop=1
-			fi
-
-			if [ $exitloop -eq 0 ] && [ `lipc-get-prop com.lab126.powerd status | grep "Charging: Yes" | wc -l` -gt 0 ]
-			then
-				# wait for the next trigger time
-				wait_for $(( 60 * $(get_time_to_next_update) ))
-				exitloop=1
-			fi
-
-			sleep 1
-		done
-	fi
-
-	if [ `lipc-get-prop com.lab126.powerd status | grep "Ready" | wc -l` -gt 0 ]
-	then
-		while [ $exitloop -eq 0 ]
-		do
-			logger "Running update on Ready status"
-			sh ./update.sh
-
-			if [ `lipc-get-prop com.lab126.powerd status | grep -E "Active|Screen Saver" | wc -l` -gt 0 ]
-			then
-				exitloop=1
-			fi
-
-			if [ $exitloop -eq 0 ]
-			then
-				# wait for the next trigger time
-				wait_for $(( 60 * $(get_time_to_next_update) ))
-			fi
-		done
-	fi
-
-	if [ $exitloop -eq 0 ] # device not in screensaver 
-	then
-		logger "Device nor in ready nor in Screensaver status"
-		sleep 10
-	fi
+# Main execution loop - much simpler and battery efficient
+while true; do
+	DEVICE_STATUS=$(lipc-get-prop com.lab126.powerd status)
+	logger "Device status: $DEVICE_STATUS"
+	
+	case "$DEVICE_STATUS" in
+		*"Screen Saver"*)
+			logger "Device in screensaver mode - performing update"
+			do_update_cycle
+			;;
+		*"Ready"*)
+			logger "Device ready - performing update"
+			do_update_cycle
+			;;
+		*"Charging: Yes"*)
+			logger "Device charging - performing update"
+			do_update_cycle
+			;;
+		*)
+			logger "Device in other state, waiting 30 seconds before recheck"
+			# Use RTC wakeup even for short waits to save power
+			set_rtc_wakeup_absolute 30
+			sleep 30
+			;;
+	esac
 done
