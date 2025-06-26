@@ -2,13 +2,13 @@
 #
 ##############################################################################
 #
-# Fetch weather screensaver from a configurable URL at configurable intervals.
+# Battery-efficient weather screensaver scheduler for Kindle
 #
 # Features:
-#   - updates even when device is suspended
-#   - refreshes screensaver image if active
-#   - turns WiFi on and back off if necessary
-#   - tries to use as little CPU as possible
+#   - updates on schedule while allowing device suspension
+#   - uses RTC wakeup to minimize battery drain
+#   - only stays awake during actual updates
+#   - handles screensaver and ready states efficiently
 #
 ##############################################################################
 
@@ -29,9 +29,8 @@ if [ -e "utils.sh" ]; then
 	source ./utils.sh
 else
 	echo "Could not find utils.sh in `pwd`"
-	exit
+	exit 1
 fi
-
 
 ###############################################################################
 
@@ -75,12 +74,12 @@ EOF
 	logger "Full two day schedule: $SCHEDULE"
 }
 
-
 ##############################################################################
 
 # return number of minutes until next update
 get_time_to_next_update () {
 	CURRENTMINUTE=$(( 60*`date +%-H` + `date +%-M` ))
+	NEXTUPDATE=-1  # Initialize to invalid value
 
 	for schedule in $SCHEDULE; do
 		read STARTHOUR STARTMINUTE ENDHOUR ENDMINUTE INTERVAL << EOF
@@ -95,77 +94,126 @@ EOF
 
 		# if this schedule entry covers the current time, use it
 		elif [ $CURRENTMINUTE -ge $START ] && [ $CURRENTMINUTE -lt $END ]; then
-			logger "Schedule $schedule used, next update in $INTERVAL minutes"
-			NEXTUPDATE=$(( $CURRENTMINUTE + $INTERVAL))
+			logger "Schedule $schedule active, interval is $INTERVAL minutes"
+			CANDIDATE_UPDATE=$(( $CURRENTMINUTE + $INTERVAL))
+			if [ $NEXTUPDATE -eq -1 ] || [ $CANDIDATE_UPDATE -lt $NEXTUPDATE ]; then
+				NEXTUPDATE=$CANDIDATE_UPDATE
+			fi
 
-		# if the next update falls into (or overlaps) a following schedule
-		# entry, apply this schedule entry instead if it would trigger earlier
-		elif [ $(( $START + $INTERVAL )) -lt $NEXTUPDATE ]; then
+		# if the next update would fall into a following schedule entry
+		elif [ $NEXTUPDATE -ne -1 ] && [ $(( $START + $INTERVAL )) -lt $NEXTUPDATE ]; then
 			logger "Selected timeout will overlap $schedule, applying it instead"
 			NEXTUPDATE=$(( $START + $INTERVAL ))
 		fi
 	done
 
-	logger "Next update in $(( $NEXTUPDATE - $CURRENTMINUTE )) minutes"
-	echo $(( $NEXTUPDATE - $CURRENTMINUTE ))
+	if [ $NEXTUPDATE -eq -1 ]; then
+		# No valid schedule found, use default interval
+		NEXTUPDATE=$(( $CURRENTMINUTE + ${INTERVAL:-240} ))
+		logger "No active schedule, using default interval"
+	fi
+
+	MINUTES_TO_WAIT=$(( $NEXTUPDATE - $CURRENTMINUTE ))
+	
+	# If we're already past the update time, schedule for next interval
+	if [ $MINUTES_TO_WAIT -le 0 ]; then
+		logger "Past scheduled time, triggering update now"
+		echo 0
+	else
+		logger "Next update in $MINUTES_TO_WAIT minutes"
+		echo $MINUTES_TO_WAIT
+	fi
 }
+
+##############################################################################
+
+# perform update with timeout protection (Kindle-compatible)
+do_update_cycle () {
+	logger "Starting update cycle"
+	
+	# Run the update in background
+	sh ./update.sh &
+	UPDATE_PID=$!
+	
+	# Wait for update to complete with timeout
+	TIMEOUT=300  # 5 minutes
+	ELAPSED=0
+	
+	while [ $ELAPSED -lt $TIMEOUT ]; do
+		if ! kill -0 $UPDATE_PID 2>/dev/null; then
+			# Process has finished
+			wait $UPDATE_PID
+			UPDATE_RESULT=$?
+			if [ $UPDATE_RESULT -eq 0 ]; then
+				logger "Update completed successfully in $ELAPSED seconds"
+			else
+				logger "Update failed with exit code $UPDATE_RESULT after $ELAPSED seconds"
+			fi
+			return
+		fi
+		
+		sleep 5
+		ELAPSED=$(( $ELAPSED + 5 ))
+	done
+	
+	# Timeout reached - kill the update process
+	logger "Update timed out after $TIMEOUT seconds, killing process $UPDATE_PID"
+	kill $UPDATE_PID 2>/dev/null
+	sleep 2
+	kill -9 $UPDATE_PID 2>/dev/null  # Force kill if still running
+	
+	logger "Update cycle finished (timed out)"
+}
+
+##############################################################################
 
 # use a 48 hour schedule
 extend_schedule
 
-while [ 1 -eq 1 ]
-do
-	logger "loooop"
-	exitloop=0
-
-	if [ `lipc-get-prop com.lab126.powerd status | grep "Screen Saver" | wc -l` -gt 0 ]
-	then
-		logger "Running update on Screen Saver status"
-
-		sh ./update.sh
-
-		while [ $exitloop -eq 0 ]
-		do
-			if [ `lipc-get-prop com.lab126.powerd status | grep "Ready" | wc -l` -gt 0 ]
-			then
-				lipc-set-prop com.lab126.powerd deferSuspend 3000000
-				exitloop=1
-			fi
-
-			if [ $exitloop -eq 0 ] && [ `lipc-get-prop com.lab126.powerd status | grep "Charging: Yes" | wc -l` -gt 0 ]
-			then
-				# wait for the next trigger time
-				wait_for $(( 60 * $(get_time_to_next_update) ))
-				exitloop=1
-			fi
-
-			sleep 1
-		done
-	fi
-
-	if [ `lipc-get-prop com.lab126.powerd status | grep "Ready" | wc -l` -gt 0 ]
-	then
-		while [ $exitloop -eq 0 ]
-		do
-			logger "Running update on Ready status"
-			sh ./update.sh
-
-			if [ `lipc-get-prop com.lab126.powerd status | grep -E "Active|Screen Saver" | wc -l` -gt 0 ]
-			then
-				exitloop=1
-			fi
-
-			if [ $exitloop -eq 0 ]
-			then
-				# wait for the next trigger time
-				wait_for $(( 60 * $(get_time_to_next_update) ))
-			fi
-		done
-	fi
-
-	if [ $exitloop -eq 0 ] # device not in screensaver 
-	then
-		logger "Device nor in ready nor in Screensaver status"
-		sleep 10
-	fi
+# Main execution loop with error recovery
+while true; do
+	DEVICE_STATUS=$(lipc-get-prop com.lab126.powerd status)
+	logger "Device status: $DEVICE_STATUS"
+	
+	case "$DEVICE_STATUS" in
+		*"Screen Saver"*)
+			logger "Device in screensaver mode - performing scheduled update"
+			
+			# Record start time for timeout detection
+			UPDATE_START_TIME=$(currentTime)
+			do_update_cycle
+			UPDATE_END_TIME=$(currentTime)
+			UPDATE_DURATION=$(( $UPDATE_END_TIME - $UPDATE_START_TIME ))
+			
+			logger "Update took $UPDATE_DURATION seconds"
+			
+			# Wait for next scheduled update
+			WAIT_MINUTES=$(get_time_to_next_update)
+			logger "Next update in $WAIT_MINUTES minutes, sleeping until then"
+			wait_for_suspend $(( $WAIT_MINUTES * 60 ))
+			;;
+		*"Ready"*)
+			logger "Device ready - performing scheduled update"
+			
+			# Record start time for timeout detection
+			UPDATE_START_TIME=$(currentTime)
+			do_update_cycle
+			UPDATE_END_TIME=$(currentTime)
+			UPDATE_DURATION=$(( $UPDATE_END_TIME - $UPDATE_START_TIME ))
+			
+			logger "Update took $UPDATE_DURATION seconds"
+			
+			# Wait for next scheduled update  
+			WAIT_MINUTES=$(get_time_to_next_update)
+			logger "Next update in $WAIT_MINUTES minutes, sleeping until then"
+			wait_for_suspend $(( $WAIT_MINUTES * 60 ))
+			;;
+		*)
+			logger "Device in other state, waiting 60 seconds before recheck"
+			wait_for_suspend 60
+			;;
+	esac
+	
+	# Safety check - if we somehow get here without sleeping, add a small delay
+	sleep 1
 done
